@@ -69,12 +69,16 @@ enum Connection {
 
 impl Connection {
     async fn connect(parsed: &AgentUrl) -> anyhow::Result<Self> {
+        // Dial the bare relay host (tls_domain), not the id-prefixed
+        // `<id>.relay.<domain>` name: the relay routes by the `connect`
+        // message's target id, so the subdomain never needs DNS resolution.
+        // In direct mode tls_domain == relay_host, so this is unchanged there.
         let stream = tokio::time::timeout(
             CONNECT_TIMEOUT,
-            TcpStream::connect((parsed.relay_host.as_str(), parsed.port)),
+            TcpStream::connect((parsed.tls_domain.as_str(), parsed.port)),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("Connection timeout to {}:{}", parsed.relay_host, parsed.port))??;
+        .map_err(|_| anyhow::anyhow!("Connection timeout to {}:{}", parsed.tls_domain, parsed.port))??;
 
         let mut conn = if parsed.use_tls {
             let mut root_store = rustls::RootCertStore::empty();
