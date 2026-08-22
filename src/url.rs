@@ -23,6 +23,8 @@ pub struct AgentUrl {
     pub use_tls: bool,
     /// Agent name from path (e.g. "claude")
     pub agent: Option<String>,
+    /// Relay secret token (from AGC_RELAY_SECRET env or --relay-secret)
+    pub relay_token: Option<String>,
 }
 
 impl AgentUrl {
@@ -45,8 +47,23 @@ impl AgentUrl {
             if p.is_empty() { None } else { Some(p.to_string()) }
         });
 
-        // Parse host:port
-        let (host, explicit_port) = if let Some(colon) = host_port.rfind(':') {
+        // Parse host:port (supports IPv6 [::1]:port)
+        let (host, explicit_port) = if host_port.starts_with('[') {
+            // IPv6: [host]:port or [host]
+            let close = host_port.find(']')
+                .ok_or_else(|| anyhow::anyhow!("Invalid IPv6 address in URL"))?;
+            let h = host_port[1..close].to_string();
+            let rest = &host_port[close + 1..];
+            let port = if rest.starts_with(':') {
+                Some(rest[1..].parse::<u16>()
+                    .map_err(|_| anyhow::anyhow!("Invalid port in URL"))?)
+            } else if rest.is_empty() {
+                None
+            } else {
+                return Err(anyhow::anyhow!("Invalid URL after IPv6 address"));
+            };
+            (h, port)
+        } else if let Some(colon) = host_port.rfind(':') {
             let h = &host_port[..colon];
             let p: u16 = host_port[colon + 1..]
                 .parse()
@@ -62,10 +79,13 @@ impl AgentUrl {
         let (relay_target, relay_host, use_tls, tls_domain) = if is_relay {
             // host is like "qi7o6bj5.relay.yinnho.cn"
             // target = subdomain before ".relay."
-            // tls_domain = "relay.yinnho.cn" (matches *.yinnho.cn wildcard cert)
+            // tls_domain = the relay host itself (e.g. "relay.yinnho.cn") —
+            // SNI must match the relay's leaf/wildcard cert, NOT the parent
+            // domain suffix. (Comment previously said *.yinnho.cn wildcard,
+            // but the issued cert is a leaf for relay.yinnho.cn.)
             let parts: Vec<&str> = host.split(".relay.").collect();
             let target = parts[0].to_string();
-            let tls_domain = parts[1..].join(".");
+            let tls_domain = format!("relay.{}", parts[1..].join("."));
             (Some(target), host.clone(), true, tls_domain)
         } else {
             (None, host.clone(), false, host.clone())
@@ -81,6 +101,7 @@ impl AgentUrl {
             use_tls,
             tls_domain,
             agent,
+            relay_token: None,
         })
     }
 }
@@ -143,5 +164,22 @@ mod tests {
     #[test]
     fn test_no_scheme() {
         assert!(AgentUrl::parse("http://example.com").is_err());
+    }
+
+    #[test]
+    fn test_ipv6_url() {
+        let url = AgentUrl::parse("agent://[::1]:86/claude").unwrap();
+        assert!(url.relay_target.is_none());
+        assert_eq!(url.relay_host, "::1");
+        assert_eq!(url.port, 86);
+        assert!(!url.use_tls);
+        assert_eq!(url.agent, Some("claude".to_string()));
+    }
+
+    #[test]
+    fn test_ipv6_no_port() {
+        let url = AgentUrl::parse("agent://[::1]").unwrap();
+        assert_eq!(url.relay_host, "::1");
+        assert_eq!(url.port, 86); // default direct port
     }
 }

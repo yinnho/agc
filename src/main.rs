@@ -33,9 +33,17 @@ struct Cli {
     /// Message to send (use -- before message if it starts with -)
     message: Option<String>,
 
-    /// Auth token
+    /// Auth token (prefer AGC_TOKEN env var or --token-file for security)
     #[arg(short, long)]
     token: Option<String>,
+
+    /// Read auth token from file
+    #[arg(long)]
+    token_file: Option<String>,
+
+    /// Relay secret token (prefer AGC_RELAY_SECRET env var)
+    #[arg(long)]
+    relay_secret: Option<String>,
 
     /// Working directory for the session
     #[arg(short, long)]
@@ -96,11 +104,14 @@ impl Connection {
 
         // Relay handshake
         if let Some(ref target) = parsed.relay_target {
-            conn.send(json!({
+            let mut connect_msg = json!({
                 "type": "connect",
                 "target": target
-            }))
-            .await?;
+            });
+            if let Some(ref token) = parsed.relay_token {
+                connect_msg["token"] = json!(token);
+            }
+            conn.send(connect_msg).await?;
             let resp = conn.recv().await?;
             match resp.get("type").and_then(|v| v.as_str()) {
                 Some("connected") => {}
@@ -245,23 +256,39 @@ impl Connection {
                 }));
             }
 
-            // Collect chunk notifications
-            if resp.get("method").and_then(|v| v.as_str()) == Some("chunk") {
-                if let Some(text) = resp.pointer("/params/text").and_then(|v| v.as_str()) {
+            // Collect chunk notifications (only for our session)
+            if resp.get("method").and_then(|v| v.as_str()) == Some("sessionUpdate") {
+                if let Some(text) = resp.pointer("/params/update/content/text").and_then(|v| v.as_str()) {
                     text_parts.push(text.to_string());
                     print!("{}", text);
                     std::io::stdout().flush()?;
+                }
+            } else if resp.get("method").and_then(|v| v.as_str()) == Some("chunk") {
+                // Legacy chunk format — notifications carry no id; accept those
+                // (single-prompt CLI) or ones explicitly tagged with our id.
+                let tagged = resp.get("id").and_then(|v| v.as_i64());
+                if tagged.is_none() || tagged == Some(id) {
+                    if let Some(text) = resp.pointer("/params/text").and_then(|v| v.as_str()) {
+                        text_parts.push(text.to_string());
+                        print!("{}", text);
+                        std::io::stdout().flush()?;
+                    }
                 }
             }
         }
     }
 }
 
+const MAX_LINE_SIZE: usize = 1024 * 1024; // 1MB
+
 async fn read_line<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> anyhow::Result<Option<String>> {
     let mut line = String::new();
     let n = reader.read_line(&mut line).await?;
     if n == 0 {
         return Ok(None);
+    }
+    if line.len() > MAX_LINE_SIZE {
+        anyhow::bail!("Line too long ({} bytes, max {})", line.len(), MAX_LINE_SIZE);
     }
     Ok(Some(line.trim().to_string()))
 }
@@ -271,7 +298,28 @@ async fn read_line<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> anyhow::Result
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let parsed = AgentUrl::parse(&cli.url)?;
+    let mut parsed = AgentUrl::parse(&cli.url)?;
+
+    // Resolve relay secret: AGC_RELAY_SECRET env > --relay-secret
+    if std::env::var("AGC_RELAY_SECRET").map(|s| !s.is_empty()).unwrap_or(false) {
+        parsed.relay_token = Some(std::env::var("AGC_RELAY_SECRET").unwrap());
+    } else if let Some(ref secret) = cli.relay_secret {
+        parsed.relay_token = Some(secret.clone());
+    }
+
+    // Resolve token: --token-file > AGC_TOKEN env > --token (least secure, visible in ps)
+    let token = if let Some(ref path) = cli.token_file {
+        Some(std::fs::read_to_string(path)?.trim().to_string())
+    } else if let Ok(t) = std::env::var("AGC_TOKEN") {
+        if !t.is_empty() { Some(t) } else { None }
+    } else {
+        cli.token.clone()
+    };
+
+    // Warn if sending token over plaintext connection
+    if token.is_some() && !parsed.use_tls {
+        eprintln!("[agc] Warning: sending auth token over unencrypted connection");
+    }
 
     if cli.verbose {
         eprintln!("[agc] Connecting to {}", parsed);
@@ -283,7 +331,7 @@ async fn main() -> anyhow::Result<()> {
     if cli.verbose {
         eprintln!("[agc] Initializing...");
     }
-    conn.initialize(cli.token.as_deref()).await?;
+    conn.initialize(token.as_deref()).await?;
 
     // Get message
     let message = match cli.message {
