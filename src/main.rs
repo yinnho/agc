@@ -106,6 +106,12 @@ struct Cli {
     #[arg(short, long)]
     cwd: Option<String>,
 
+    /// Session ID to resume (agent-side conversation, e.g. claude --resume).
+    /// First round: omit it, then take the sessionId from the result output
+    /// and pass it back here to continue the same conversation.
+    #[arg(short, long)]
+    session: Option<String>,
+
     /// 借用轮：session ticket JSON 文件路径（进/出；配合 --save-ticket 实现跨轮连续）
     #[arg(long)]
     ticket: Option<String>,
@@ -294,6 +300,7 @@ impl Connection {
         agent: Option<&str>,
         message: &str,
         cwd: Option<&str>,
+        session_id: Option<&str>,
         ticket: Option<serde_json::Value>,
         materials: serde_json::Value,
         flow: Option<String>,
@@ -310,6 +317,9 @@ impl Connection {
         }
         if let Some(cwd) = cwd {
             params["cwd"] = json!(cwd);
+        }
+        if let Some(sid) = session_id {
+            params["sessionId"] = json!(sid);
         }
         if let Some(t) = ticket {
             params["sessionTicket"] = t;
@@ -333,6 +343,11 @@ impl Connection {
         .await?;
 
         let mut text_parts: Vec<String> = Vec::new();
+        // Agent-side session id parsed from the chunk stream (e.g. claude
+        // --output-format stream-json emits a final {"type":"result",...}
+        // line carrying it). The gateway result only echoes the input param,
+        // so real resume ids must come from here.
+        let mut stream_session_id: Option<String> = None;
 
         loop {
             let resp = tokio::time::timeout(RPC_TIMEOUT, self.recv())
@@ -356,10 +371,12 @@ impl Connection {
 
             if is_final {
                 let result = resp.get("result").cloned().unwrap_or(json!({}));
+                let session_id = stream_session_id
+                    .or_else(|| result.get("sessionId").and_then(|v| v.as_str().map(String::from)));
                 let mut out = json!({
                     "stopReason": result.get("stopReason").unwrap_or(&json!("endTurn")),
                     "text": text_parts.join(""),
-                    "sessionId": result.get("sessionId").unwrap_or(&json!(null))
+                    "sessionId": session_id
                 });
                 // 借用轮：更新后的票据与回传产物随最终响应带回。
                 if let Some(t) = result.get("sessionTicket") {
@@ -384,6 +401,19 @@ impl Connection {
                 let tagged = resp.get("id").and_then(|v| v.as_i64());
                 if tagged.is_none() || tagged == Some(id) {
                     if let Some(text) = resp.pointer("/params/text").and_then(|v| v.as_str()) {
+                        // Opportunistic session-id harvest from structured
+                        // agent output (claude stream-json result line).
+                        if stream_session_id.is_none() {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+                                if v.get("type").and_then(|t| t.as_str()) == Some("result") {
+                                    if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
+                                        if valid_session_id(sid) {
+                                            stream_session_id = Some(sid.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         text_parts.push(text.to_string());
                         print!("{}", text);
                         std::io::stdout().flush()?;
@@ -394,8 +424,17 @@ impl Connection {
     }
 }
 
-async fn read_line<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> anyhow::Result<Option<String>> {
-    let mut line = String::new();
+/// Same charset gate as the gateway (aginx handler.rs): alphanumeric,
+/// hyphen, underscore. Anything else is not a safe session id to echo
+/// back into resume args.
+fn valid_session_id(sid: &str) -> bool {
+    !sid.is_empty()
+        && sid
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+async fn read_line<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> anyhow::Result<Option<String>> {    let mut line = String::new();
     let n = reader.read_line(&mut line).await?;
     if n == 0 {
         return Ok(None);
@@ -515,6 +554,7 @@ async fn main() -> anyhow::Result<()> {
             parsed.agent.as_deref(),
             &message,
             cli.cwd.as_deref(),
+            cli.session.as_deref(),
             ticket_val,
             json!(mats),
             cli.flow.clone(),
@@ -553,6 +593,15 @@ async fn main() -> anyhow::Result<()> {
                     Err(e) => eprintln!("[agc] Failed to decode {name}: {e}"),
                 }
             }
+        }
+    }
+
+    // Session ID for resume: agent-side conversation id from the chunk stream
+    // (e.g. claude --output-format stream-json result line). Pass it back with
+    // --session to continue this conversation.
+    if let Some(sid) = result.get("sessionId").and_then(|v| v.as_str()) {
+        if !sid.is_empty() {
+            eprintln!("[agc] sessionId: {sid} (--session {sid} 续接)");
         }
     }
 
