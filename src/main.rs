@@ -126,6 +126,10 @@ struct Cli {
     #[arg(long)]
     flow: Option<String>,
 
+    /// 借用者身份（网关无鉴权时采信此值做 friends 名单门；也可用 AGC_BORROWER env）
+    #[arg(long)]
+    borrower: Option<String>,
+
     /// Verbose output
     #[arg(short, long)]
     verbose: bool,
@@ -292,6 +296,7 @@ impl Connection {
         ticket: Option<serde_json::Value>,
         materials: serde_json::Value,
         flow: Option<String>,
+        borrower: Option<String>,
     ) -> anyhow::Result<Value> {
         let id = next_id();
 
@@ -313,6 +318,9 @@ impl Connection {
         }
         if let Some(f) = flow {
             params["activeFlow"] = json!(f);
+        }
+        if let Some(b) = borrower {
+            params["borrower"] = json!(b);
         }
 
         self.send(json!({
@@ -481,6 +489,10 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("[agc] Sending prompt...");
     }
 
+    let borrower = cli
+        .borrower
+        .clone()
+        .or_else(|| std::env::var("AGC_BORROWER").ok().filter(|v| !v.is_empty()));
     let result = conn
         .prompt(
             parsed.agent.as_deref(),
@@ -489,6 +501,7 @@ async fn main() -> anyhow::Result<()> {
             ticket_val,
             json!(mats),
             cli.flow.clone(),
+            borrower,
         )
         .await?;
 
