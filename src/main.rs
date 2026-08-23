@@ -467,7 +467,23 @@ async fn main() -> anyhow::Result<()> {
             Some(serde_json::from_str::<Value>(&raw)
                 .map_err(|e| anyhow::anyhow!("Ticket file {path} is not valid JSON: {e}"))?)
         }
-        None => None,
+        None => {
+            // 借用信号在但没带票据：自动用空票据开局，让第一轮就走无状态
+            // 借道路径（sessionTicket 参数在场即触发）。否则首轮落进服务器
+            // 持久 session，违背"借用者零持久化"。
+            let env_borrower =
+                std::env::var("AGC_BORROWER").map(|s| !s.is_empty()).unwrap_or(false);
+            if cli.borrower.is_some() || env_borrower || !cli.materials.is_empty() {
+                Some(json!({
+                    "version": 1,
+                    "label": null,
+                    "messages": [],
+                    "turnSummaries": []
+                }))
+            } else {
+                None
+            }
+        }
     };
     let mut mats = Vec::new();
     use std::io::Read as _;
