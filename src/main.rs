@@ -288,6 +288,7 @@ impl Connection {
     }
 
     /// Send a prompt and collect streaming response
+    #[allow(clippy::too_many_arguments)]
     async fn prompt(
         &mut self,
         agent: Option<&str>,
@@ -565,4 +566,118 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// ACP.md 金样本互锁测试（协议立法层）。
+///
+/// ACP.md 住在隔壁 aginx 仓——agc 是协议唯一客户端，参数名/结果形状与文档
+/// 打架即测试红。独立 clone（GitHub CI）没有该文件时跳过。
+#[cfg(test)]
+mod golden_tests {
+    use serde_json::json;
+
+    fn doc() -> Option<String> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../aginx/ACP.md");
+        match std::fs::read_to_string(path) {
+            Ok(d) => Some(d),
+            Err(_) => {
+                eprintln!("SKIP golden_tests: {path} 不存在（独立 clone 无 aginx 仓）");
+                None
+            }
+        }
+    }
+
+    fn golden(doc: &str, name: &str) -> serde_json::Value {
+        let marker = format!("<!-- golden: {name} -->");
+        let start = doc
+            .find(&marker)
+            .unwrap_or_else(|| panic!("ACP.md 缺金样本标记: {name}"));
+        let rest = &doc[start + marker.len()..];
+        let fence = rest
+            .find("```json")
+            .unwrap_or_else(|| panic!("金样本 {name} 后缺 ```json 围栏"));
+        let body = &rest[fence + "```json".len()..];
+        let end = body
+            .find("```")
+            .unwrap_or_else(|| panic!("金样本 {name} 围栏未闭合"));
+        serde_json::from_str(body[..end].trim())
+            .unwrap_or_else(|e| panic!("金样本 {name} 不是合法 JSON: {e}"))
+    }
+
+    /// 借用轮 prompt 参数名——锁死 agc prompt() 的参数装配与文档一致。
+    #[test]
+    fn borrowed_prompt_param_names() {
+        let Some(doc) = doc() else { return };
+        let v = golden(&doc, "external_prompt_borrowed_request");
+        let params = v.get("params").expect("params 必填");
+        for key in [
+            "agent",
+            "message",
+            "sessionTicket",
+            "materials",
+            "activeFlow",
+            "borrower",
+        ] {
+            assert!(params.get(key).is_some(), "prompt params 缺 {key}");
+        }
+    }
+
+    /// 普通轮参数——message 是扁平字符串，不带 ContentBlock 数组。
+    #[test]
+    fn plain_prompt_param_names() {
+        let Some(doc) = doc() else { return };
+        let v = golden(&doc, "external_prompt_plain_request");
+        let params = v.get("params").expect("params 必填");
+        assert!(params.get("message").and_then(|m| m.as_str()).is_some());
+        for absent in ["sessionTicket", "materials", "activeFlow", "borrower"] {
+            assert!(params.get(absent).is_none(), "普通轮不应带 {absent}");
+        }
+    }
+
+    /// 最终结果消费形状——agc 的 is_final 判据 + sessionTicket/files 提取。
+    #[test]
+    fn final_result_consumer_shape() {
+        let Some(doc) = doc() else { return };
+        let v = golden(&doc, "external_final_result_borrowed");
+        assert!(v.get("id").is_none(), "最终响应不带 id（agc 靠 result.stopReason 判终）");
+        let result = v.get("result").expect("result 必填");
+        assert_eq!(
+            result.get("stopReason").and_then(|s| s.as_str()),
+            Some("endTurn")
+        );
+        assert!(result.get("sessionTicket").is_some());
+        assert!(result.get("files").is_some());
+    }
+
+    /// chunk 通知形状——agc 只消费 params.text。
+    #[test]
+    fn chunk_notification_shape() {
+        let Some(doc) = doc() else { return };
+        let v = golden(&doc, "external_chunk_notification");
+        assert_eq!(v.get("method").and_then(|m| m.as_str()), Some("chunk"));
+        assert!(v.pointer("/params/text").and_then(|t| t.as_str()).is_some());
+    }
+
+    /// 票据键名 camelCase——agc 的自动空票据构造器（main 里 turnSummaries）
+    /// 必须与桥的 SessionTicket serde 同名，否则首轮票据被静默吞字段。
+    #[test]
+    fn ticket_key_names_camel() {
+        let Some(doc) = doc() else { return };
+        let v = golden(&doc, "ticket_v1");
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["contextWindowTokens", "label", "messages", "turnSummaries", "version"]
+        );
+        let opener = json!({
+            "version": 1,
+            "label": null,
+            "messages": [],
+            "turnSummaries": []
+        });
+        for (k, _) in opener.as_object().unwrap() {
+            assert!(v.get(k).is_some(), "空票据构造器用了票据没有的键 {k}");
+        }
+    }
 }

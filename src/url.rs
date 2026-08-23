@@ -54,8 +54,8 @@ impl AgentUrl {
                 .ok_or_else(|| anyhow::anyhow!("Invalid IPv6 address in URL"))?;
             let h = host_port[1..close].to_string();
             let rest = &host_port[close + 1..];
-            let port = if rest.starts_with(':') {
-                Some(rest[1..].parse::<u16>()
+            let port = if let Some(p) = rest.strip_prefix(':') {
+                Some(p.parse::<u16>()
                     .map_err(|_| anyhow::anyhow!("Invalid port in URL"))?)
             } else if rest.is_empty() {
                 None
