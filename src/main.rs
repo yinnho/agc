@@ -136,6 +136,27 @@ struct Cli {
     #[arg(long)]
     borrower: Option<String>,
 
+    /// 主人绑定：配对码（bindDevice → token 入本地钥匙串后退出，不发消息）
+    #[arg(long = "bind")]
+    bind_code: Option<String>,
+
+    /// --bind 时的设备名（默认 <USER>-agc）
+    #[arg(long)]
+    device_name: Option<String>,
+
+    /// 访客申请：名字（requestAccess → 轮询等主人同意 → token 入钥匙串后退出）。
+    /// agent 范围取 URL 路径后缀（agent://gw/clone-creator 即只申请该分身）
+    #[arg(long)]
+    request_access: Option<String>,
+
+    /// --request-access 等主人同意的秒数（0 = 只挂单不等待；默认 300）
+    #[arg(long, default_value_t = 300)]
+    wait_secs: u64,
+
+    /// 忘掉该网关存的 token（吊销/过期/换身份时用）
+    #[arg(long)]
+    logout: bool,
+
     /// Verbose output
     #[arg(short, long)]
     verbose: bool,
@@ -250,6 +271,89 @@ impl Connection {
         }
 
         Ok(resp)
+    }
+
+    /// Plain request/response RPC (admin & consent methods — no streaming).
+    /// Returns the result object; bails on JSON-RPC error.
+    async fn rpc(&mut self, method: &str, params: Value) -> anyhow::Result<Value> {
+        let id = next_id();
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params
+        }))
+        .await?;
+        loop {
+            let resp = tokio::time::timeout(RPC_TIMEOUT, self.recv())
+                .await
+                .map_err(|_| anyhow::anyhow!("Timeout waiting for {method} response"))??;
+            match resp.get("id").and_then(|v| v.as_i64()) {
+                Some(rid) if rid == id => {
+                    if let Some(error) = resp.get("error") {
+                        if !error.is_null() {
+                            let msg = error["message"].as_str().unwrap_or("Unknown error");
+                            let code = error["code"].as_i64().unwrap_or(0);
+                            anyhow::bail!("Error ({}): {}", code, msg);
+                        }
+                    }
+                    return Ok(resp.get("result").cloned().unwrap_or(json!({})));
+                }
+                // Stray notification (heartbeat etc.) — wait for our reply.
+                _ => continue,
+            }
+        }
+    }
+
+    /// bindDevice（ACP.md §2.3）：私有网关主人配对。成功后本连接升 Bound
+    /// （网关把新 auth 状态记在 relay client 上），可直接 listAgents 确认。
+    async fn bind_device(&mut self, pair_code: &str, device_name: &str) -> anyhow::Result<(String, String)> {
+        let result = self
+            .rpc("bindDevice", json!({"pairCode": pair_code, "deviceName": device_name}))
+            .await?;
+        let token = result
+            .get("token")
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| anyhow::anyhow!("bindDevice 响应缺 token"))?
+            .to_string();
+        let name = result
+            .get("deviceName")
+            .and_then(|d| d.as_str())
+            .unwrap_or(device_name)
+            .to_string();
+        Ok((name, token))
+    }
+
+    /// requestAccess（§2.9 访客申请）。返回完整 result（status/…）。
+    async fn request_access(&mut self, client_name: &str, agent: Option<&str>) -> anyhow::Result<Value> {
+        let mut params = json!({"clientName": client_name});
+        if let Some(a) = agent {
+            params["agent"] = json!(a);
+        }
+        self.rpc("requestAccess", params).await
+    }
+
+    /// checkAccess（§2.9 访客轮询取票）：approved = 一次性 token，网关销单。
+    async fn check_access(&mut self, request_id: &str) -> anyhow::Result<Value> {
+        self.rpc("checkAccess", json!({"requestId": request_id})).await
+    }
+
+    /// listAgents：确认 token 可用 + 打印可用分身。
+    async fn list_agents(&mut self) -> anyhow::Result<Vec<(String, String)>> {
+        let result = self.rpc("listAgents", json!({})).await?;
+        let agents = result
+            .get("agents")
+            .and_then(|a| a.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(agents
+            .iter()
+            .filter_map(|a| {
+                let id = a.get("id").and_then(|v| v.as_str())?;
+                let name = a.get("name").and_then(|v| v.as_str()).unwrap_or(id);
+                Some((id.to_string(), name.to_string()))
+            })
+            .collect())
     }
 
     async fn send(&mut self, msg: Value) -> anyhow::Result<()> {
@@ -445,7 +549,123 @@ async fn read_line<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> anyhow::Result
     Ok(Some(line.trim().to_string()))
 }
 
+// ── 本地钥匙串（per-网关单身份：主人 token 或 访客 token） ──
+
+/// 网关身份键：relay 网关 = target id（跨端口稳定）；直连 = host:port。
+fn gateway_key(u: &AgentUrl) -> String {
+    match u.relay_target {
+        Some(ref t) => t.clone(),
+        None => format!("{}:{}", u.relay_host, u.port),
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+struct StoredIdentity {
+    /// 网关发的 token（bindDevice Bound token 或同意流 Authorized token）。
+    /// None = 只挂了单还没取到票。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
+    /// 设备名（主人）或访客名
+    name: String,
+    /// "owner" | "visitor"
+    role: String,
+    /// 访客挂单 id（wait 超时留下，下次 --request-access 同名续轮）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_request_id: Option<String>,
+    saved_at: i64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default, Debug, PartialEq)]
+struct TokenStore {
+    #[serde(default)]
+    gateways: std::collections::BTreeMap<String, StoredIdentity>,
+}
+
+impl TokenStore {
+    fn path() -> anyhow::Result<std::path::PathBuf> {
+        let home = std::env::var("HOME")
+            .map_err(|_| anyhow::anyhow!("HOME 未设置，找不到钥匙串路径"))?;
+        Ok(std::path::Path::new(&home).join(".aginx/agc/tokens.json"))
+    }
+
+    /// 文件缺失/损坏 → 空 store（损坏告警不 panic——钥匙串可重建）。
+    fn load() -> Self {
+        let Ok(path) = Self::path() else {
+            return Self::default();
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
+                eprintln!("[agc] 钥匙串损坏（{}），按空处理——旧 token 需重新绑定", e);
+                Self::default()
+            }),
+            Err(_) => Self::default(),
+        }
+    }
+
+    /// 原子写（tmp+rename）+ 0600 权限。
+    fn save(&self) -> anyhow::Result<()> {
+        let path = Self::path()?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_string_pretty(self)?)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    fn now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+}
+
+fn default_device_name() -> String {
+    std::env::var("USER")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .map(|u| format!("{u}-agc"))
+        .unwrap_or_else(|| "agc".to_string())
+}
+
 // ── Main ──
+
+/// 同意流收尾：取票（approved 响应）→ 入钥匙串。
+fn finish_consent(
+    store: &mut TokenStore,
+    gw_key: &str,
+    name: &str,
+    request_id: &str,
+    res: &Value,
+    url: &str,
+) -> anyhow::Result<()> {
+    let token = res
+        .get("token")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| anyhow::anyhow!("approved 响应缺 token"))?
+        .to_string();
+    store.gateways.insert(
+        gw_key.to_string(),
+        StoredIdentity {
+            token: Some(token),
+            name: name.to_string(),
+            role: "visitor".to_string(),
+            pending_request_id: None, // 已销单
+            saved_at: TokenStore::now(),
+        },
+    );
+    store.save()?;
+    eprintln!("[agc] 主人已同意，取票成功（挂单 {request_id} 已销），token 已入 {}", TokenStore::path()?.display());
+    eprintln!("[agc] 现在可以直接对话：agc {url} <消息>");
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -460,7 +680,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Resolve token: --token-file > AGC_TOKEN env > --token (least secure, visible in ps)
-    let token = if let Some(ref path) = cli.token_file {
+    let explicit_token = if let Some(ref path) = cli.token_file {
         Some(std::fs::read_to_string(path)?.trim().to_string())
     } else if let Ok(t) = std::env::var("AGC_TOKEN") {
         if !t.is_empty() { Some(t) } else { None }
@@ -468,13 +688,177 @@ async fn main() -> anyhow::Result<()> {
         cli.token.clone()
     };
 
+    // ── 钥匙串：per-网关身份（bind/同意流的产物） ──
+    let gw_key = gateway_key(&parsed);
+    let mut store = TokenStore::load();
+
+    if cli.logout {
+        match store.gateways.remove(&gw_key) {
+            Some(old) => {
+                store.save()?;
+                eprintln!("[agc] 已忘掉 {gw_key}（{}·{}）的 token", old.role, old.name);
+            }
+            None => eprintln!("[agc] {gw_key} 本来就没存 token"),
+        }
+        return Ok(());
+    }
+
+    if cli.bind_code.is_some() && cli.request_access.is_some() {
+        anyhow::bail!("--bind 与 --request-access 二选一");
+    }
+
     // Warn if sending token over plaintext connection
-    if token.is_some() && !parsed.use_tls {
+    if explicit_token.is_some() && !parsed.use_tls {
         eprintln!("[agc] Warning: sending auth token over unencrypted connection");
     }
 
     if cli.verbose {
         eprintln!("[agc] Connecting to {}", parsed);
+    }
+
+    // ── 绑定流：bindDevice → token 入钥匙串 ──
+    if let Some(code) = cli.bind_code.clone() {
+        let device = cli.device_name.clone().unwrap_or_else(default_device_name);
+        let mut conn = Connection::connect(&parsed).await?;
+        conn.initialize(None).await?;
+        let (bound_name, token) = conn.bind_device(&code, &device).await?;
+        // 本连接已升 Bound——直接 listAgents 确认 token 可用
+        let agents = conn.list_agents().await?;
+        store.gateways.insert(
+            gw_key.clone(),
+            StoredIdentity {
+                token: Some(token),
+                name: bound_name.clone(),
+                role: "owner".to_string(),
+                pending_request_id: None,
+                saved_at: TokenStore::now(),
+            },
+        );
+        store.save()?;
+        eprintln!("[agc] 绑定成功：{gw_key} · {bound_name}（token 已入 {}）", TokenStore::path()?.display());
+        eprintln!("[agc] 可用分身：{}", agents.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>().join(", "));
+        eprintln!("[agc] 现在可以直接对话：agc {} <消息>", cli.url);
+        return Ok(());
+    }
+
+    // ── 同意流：requestAccess → 轮询等主人同意 → 取票入钥匙串 ──
+    if let Some(name) = cli.request_access.clone() {
+        let mut conn = Connection::connect(&parsed).await?;
+        conn.initialize(None).await?;
+        let scope = parsed.agent.clone(); // 客服码后缀 = URL 路径 agent
+
+        // 上次同名挂单还在？先续轮（approved 直接取票；notFound 才重新挂）
+        let mut request_id: Option<String> = None;
+        let prev = store.gateways.get(&gw_key).cloned();
+        if let Some(prev) = prev {
+            if prev.role == "visitor" && prev.name == name {
+                if let Some(rid) = &prev.pending_request_id {
+                    let res = conn.check_access(rid).await?;
+                    match res.get("status").and_then(|s| s.as_str()) {
+                        Some("approved") => {
+                            finish_consent(&mut store, &gw_key, &name, rid, &res, &cli.url)?;
+                            return Ok(());
+                        }
+                        Some("pending") => request_id = Some(rid.clone()),
+                        _ => {} // notFound：被拒/过期 → 走新挂单
+                    }
+                }
+            }
+        }
+
+        if request_id.is_none() {
+            let res = conn.request_access(&name, scope.as_deref()).await?;
+            match res.get("status").and_then(|s| s.as_str()) {
+                Some("approved") => {
+                    // auto_approve 网关：即申即得，无 requestId
+                    store.gateways.insert(
+                        gw_key.clone(),
+                        StoredIdentity {
+                            token: res.get("token").and_then(|t| t.as_str()).map(String::from),
+                            name: name.clone(),
+                            role: "visitor".to_string(),
+                            pending_request_id: None,
+                            saved_at: TokenStore::now(),
+                        },
+                    );
+                    store.save()?;
+                    eprintln!("[agc] 即时授权（auto_approve 网关），token 已入 {}]", TokenStore::path()?.display());
+                    eprintln!("[agc] 现在可以直接对话：agc {} <消息>", cli.url);
+                    return Ok(());
+                }
+                Some("pending") => {
+                    request_id = res
+                        .get("requestId")
+                        .and_then(|r| r.as_str())
+                        .map(String::from);
+                }
+                other => anyhow::bail!("requestAccess 未知状态: {other:?}"),
+            }
+        }
+        let Some(request_id) = request_id else {
+            anyhow::bail!("pending 响应缺 requestId");
+        };
+
+        if cli.wait_secs == 0 {
+            store.gateways.insert(
+                gw_key.clone(),
+                StoredIdentity {
+                    token: None,
+                    name: name.clone(),
+                    role: "visitor".to_string(),
+                    pending_request_id: Some(request_id),
+                    saved_at: TokenStore::now(),
+                },
+            );
+            store.save()?;
+            eprintln!("[agc] 已挂单（{}·{name}，24h 内有效）。主人同意后重跑本命令取票：", gw_key);
+            eprintln!("[agc]   agc {} --request-access {name} --wait-secs 600", cli.url);
+            return Ok(());
+        }
+
+        eprintln!("[agc] 已挂单，等主人同意（最多 {}s，Ctrl-C 放弃不销单）…", cli.wait_secs);
+        let deadline = std::time::Instant::now() + Duration::from_secs(cli.wait_secs);
+        loop {
+            if std::time::Instant::now() >= deadline {
+                store.gateways.insert(
+                    gw_key.clone(),
+                    StoredIdentity {
+                        token: None,
+                        name: name.clone(),
+                        role: "visitor".to_string(),
+                        pending_request_id: Some(request_id.clone()),
+                        saved_at: TokenStore::now(),
+                    },
+                );
+                store.save()?;
+                anyhow::bail!("等待超时（{}s）。挂单仍在——主人同意后重跑本命令取票", cli.wait_secs);
+            }
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let res = conn.check_access(&request_id).await?;
+            match res.get("status").and_then(|s| s.as_str()) {
+                Some("approved") => {
+                    finish_consent(&mut store, &gw_key, &name, &request_id, &res, &cli.url)?;
+                    return Ok(());
+                }
+                Some("pending") => continue,
+                Some("notFound") => anyhow::bail!("申请被拒或已过期（网关不区分两者）"),
+                other => anyhow::bail!("checkAccess 未知状态: {other:?}"),
+            }
+        }
+    }
+
+    // ── 普通对话轮：token = 显式来源 > 钥匙串 ──
+    let stored = store.gateways.get(&gw_key).cloned();
+    let used_stored_token =
+        explicit_token.is_none() && stored.as_ref().is_some_and(|s| s.token.is_some());
+    let token = explicit_token.or_else(|| stored.as_ref().and_then(|s| s.token.clone()));
+    if used_stored_token {
+        if cli.verbose {
+            eprintln!("[agc] 用钥匙串 token（{}·{}）from {}", stored.as_ref().unwrap().role, stored.as_ref().unwrap().name, TokenStore::path()?.display());
+        }
+        if !parsed.use_tls {
+            eprintln!("[agc] Warning: sending auth token over unencrypted connection");
+        }
     }
 
     let mut conn = Connection::connect(&parsed).await?;
@@ -483,7 +867,20 @@ async fn main() -> anyhow::Result<()> {
     if cli.verbose {
         eprintln!("[agc] Initializing...");
     }
-    conn.initialize(token.as_deref()).await?;
+    let init_resp = conn.initialize(token.as_deref()).await?;
+    // 钥匙串 token 被网关拒（吊销/过期）→ 明说，别等 prompt 才炸
+    if used_stored_token {
+        let authed = init_resp
+            .pointer("/result/authenticated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !authed {
+            anyhow::bail!(
+                "钥匙串里的 token 已失效（被吊销或过期）。清掉重来：\n  agc {} --logout\n  agc {} --request-access <名字>   # 或 --bind <配对码>",
+                cli.url, cli.url
+            );
+        }
+    }
 
     // Get message
     let message = match cli.message {
@@ -549,7 +946,7 @@ async fn main() -> anyhow::Result<()> {
         .borrower
         .clone()
         .or_else(|| std::env::var("AGC_BORROWER").ok().filter(|v| !v.is_empty()));
-    let result = conn
+    let result = match conn
         .prompt(
             parsed.agent.as_deref(),
             &message,
@@ -560,7 +957,20 @@ async fn main() -> anyhow::Result<()> {
             cli.flow.clone(),
             borrower,
         )
-        .await?;
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            // 私有网关裸敲 URL 的经典死法——把两条活路指出来
+            if e.to_string().contains("Authentication required") {
+                eprintln!();
+                eprintln!("[agc] 该网关是私有的，当前没有有效凭证。两条路：");
+                eprintln!("[agc]   主人：agc {} --bind <配对码>", cli.url);
+                eprintln!("[agc]   访客：agc {} --request-access <你的名字>", cli.url);
+            }
+            return Err(e);
+        }
+    };
 
     // 借用轮回执：保存更新后的票据、落盘回传产物。
     if let (Some(path), Some(t)) = (&cli.save_ticket, result.get("sessionTicket")) {
@@ -728,5 +1138,53 @@ mod golden_tests {
         for (k, _) in opener.as_object().unwrap() {
             assert!(v.get(k).is_some(), "空票据构造器用了票据没有的键 {k}");
         }
+    }
+}
+
+/// 钥匙串与网关键测试。
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+
+    /// relay 网关键 = target id（端口变化不影响身份）；直连 = host:port。
+    #[test]
+    fn gateway_key_relay_vs_direct() {
+        let r = AgentUrl::parse("agent://selvkwjv.relay.aginx.net:8443/claude").unwrap();
+        assert_eq!(gateway_key(&r), "selvkwjv");
+        let r2 = AgentUrl::parse("agent://selvkwjv.relay.aginx.net/claude").unwrap();
+        assert_eq!(gateway_key(&r2), "selvkwjv", "显式端口与默认端口同一身份");
+        let d = AgentUrl::parse("agent://192.168.1.100:86").unwrap();
+        assert_eq!(gateway_key(&d), "192.168.1.100:86");
+    }
+
+    /// 往返：insert → JSON → load 回来字段齐（pending 态与取票态两种）。
+    #[test]
+    fn store_roundtrip_pending_and_approved() {
+        let mut s = TokenStore::default();
+        s.gateways.insert(
+            "gw1".into(),
+            StoredIdentity {
+                token: None,
+                name: "张三".into(),
+                role: "visitor".into(),
+                pending_request_id: Some("req-abc".into()),
+                saved_at: 123,
+            },
+        );
+        s.gateways.insert(
+            "gw2".into(),
+            StoredIdentity {
+                token: Some("token-x".into()),
+                name: "sophie-agc".into(),
+                role: "owner".into(),
+                pending_request_id: None,
+                saved_at: 456,
+            },
+        );
+        let raw = serde_json::to_string(&s).unwrap();
+        let back: TokenStore = serde_json::from_str(&raw).unwrap();
+        assert_eq!(back, s);
+        // pending 态：token 字段不落盘（skip_serializing_if）
+        assert!(!raw.contains("\"token\": null"));
     }
 }
