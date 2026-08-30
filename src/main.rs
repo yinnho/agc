@@ -87,7 +87,9 @@ struct Cli {
     /// agent:// URL (e.g. agent://id.relay.example.com/claude)
     url: String,
 
-    /// Message to send (use -- before message if it starts with -)
+    /// Message to send (use -- before message if it starts with -).
+    /// 省略时从 stdin 读到 EOF（多行 prompt 完整进入）
+    #[arg(verbatim_doc_comment)]
     message: Option<String>,
 
     /// Auth token (prefer AGC_TOKEN env var or --token-file for security)
@@ -669,7 +671,13 @@ fn finish_consent(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    // `agc ask <url> …` 兼容（CARRIER.md §3.4-2 的命令字面）：剥掉裸 `ask`
+    // 前缀再交给 clap——子命令糖不动 Cli 形状，`agc <url>` 原样可用。
+    let mut argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("ask") {
+        argv.remove(1);
+    }
+    let cli = Cli::parse_from(argv);
     let mut parsed = AgentUrl::parse(&cli.url)?;
 
     // Resolve relay secret: AGC_RELAY_SECRET env > --relay-secret
@@ -882,12 +890,13 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Get message
+    // Get message: 参数优先；否则 stdin **读到 EOF**（多行 prompt 不截断，
+    // 管道/heredoc 自然闭合；交互终端单行用 Ctrl-D 结束）。
     let message = match cli.message {
         Some(msg) => msg,
         None => {
             let mut input = String::new();
-            std::io::stdin().read_line(&mut input)?;
+            std::io::stdin().read_to_string(&mut input)?;
             input.trim().to_string()
         }
     };
